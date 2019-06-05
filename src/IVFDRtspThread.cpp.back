@@ -1,0 +1,781 @@
+﻿
+#define	SDKLIB_TEST
+#ifdef SDKLIB_TEST
+#include <linux/videodev2.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <linux/fb.h>
+#include "pthread.h"
+
+//#include "drv_disp.h"
+//#include "dragonboard_inc.h"
+#include "hwdisp2.h"
+#include "aw_ini_parser.h"
+
+#include <sdklog.h>
+
+#include "CameraDebug.h"
+#include "hwdisp2.h"
+
+#include "V4L2CameraDevice2.h"
+#include "CallbackNotifier.h"
+#include "PreviewWindow.h"
+#include "CameraHardware2.h"
+#include "HALCameraFactory.h"
+#include "CameraHardwareInterface.h"
+#endif
+
+#ifdef REC_ENCODE
+#include "awrecorder.h"
+
+#endif
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include <errno.h>
+
+#include <sys/time.h>
+#include "log.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "vencoder.h"
+#include "CdxMuxer.h"
+#include <time.h>
+
+#include "Rtc.h"
+#include "StorageManager.h"
+#include "DvrFactory.h"
+
+static FILE* h264fp;
+pthread_t currentpthread = -1;
+extern pthread_t gl_rtsptid;
+
+char header[] = {
+    0x00, 0x00, 0x00, 0x01, 0x67, 0x4d, 0x00,0x1f,
+    0xe5, 0x40, 0x28, 0x02, 0xd8, 0x80, 0x00,0x00,
+    0x00, 0x01, 0x68, 0xee, 0x31, 0x12};
+#define CAM0 0;
+#define CAM1 1;
+// by wanggy
+#define WANGGY
+#define IMGPROCESS 0
+
+
+#ifdef WANGGY
+#include <stdio.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <pthread.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <errno.h>
+#include <sys/un.h>
+
+#define UNIX_DOMAIN "/tmp/rtsph264.sock"
+
+
+
+typedef struct framehead
+{
+    char bySync;
+    char byType;
+    char byReserve[2];
+    int dwTimeStamp;
+    int dwDataLen;
+
+#define FRAME_HEAD_SYNC 0x47
+#define FRAME_DATA_TYPE 0x1
+
+} tFrameHead;
+
+#define RECV_TIMEOUT 2
+#define BUF_SIZE 4096
+//int is_exit = 0;
+static int is_exit = 0;
+
+static int send_sock_rtsp = -1;
+
+#endif
+
+
+#define RECORD_TEST 1
+
+#define TEST_CAMERA_ID 0
+#define TEST_CAMERA_ID2 1
+
+#define TEST_CAMERA_ID_T1 0
+#define TEST_CAMERA_ID_T2 1
+
+using namespace std;
+
+#define HAVA_TWO_CAMERA 1  //While move to cfg
+#define CAMERA_FONT 0  //While move to cfg
+#define CAMERA_BACK 1 //While move to cfg
+
+#define LOG_BUF_SIZE	1024
+#define VIEW_WEITH 480 //720
+#define VIEW_HEIGHT 320 //480
+
+
+static VencInputBuffer inputBuffer;
+
+
+static CPlayWindow *pstaticthis=NULL;
+extern IVFDUiDesign *pIVFDUiDesign;
+QMutex m_mutex;
+QWaitCondition m_wcond;
+
+#if defined(Q_OS_LINUX)
+using namespace android;
+#endif
+
+nsecs_t nsStamp;
+
+#if defined(Q_OS_LINUX)
+
+static long long GetNowUs()
+{
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    return now.tv_sec * 1000000 + now.tv_usec;
+}
+
+static int set_socket_timeout(int socket, int time)
+{
+
+    int ret;
+    struct timeval tv;
+    tv.tv_sec = time;
+    tv.tv_usec = 0;
+    if(socket == -1 || time <= 0)
+    {
+        return -1;
+    }
+
+    //½ÓÊÕ³¬Ê±
+    ret = setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if(ret < 0)
+    {
+        perror("setsockopt error");
+        return -1;
+    }
+
+    //·¢ËÍ³¬Ê±
+    ret = setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if(ret < 0)
+    {
+        perror("setsockopt error");
+        return -1;
+    }
+
+    return 0;
+}
+
+static void send_h264_header()
+{
+
+    tFrameHead rtspheader;
+    rtspheader.bySync = FRAME_HEAD_SYNC;
+    rtspheader.byType = FRAME_DATA_TYPE;
+    rtspheader.dwDataLen = sizeof(header);
+
+    int send_length;
+    send_length = send(send_sock_rtsp, &rtspheader, sizeof(rtspheader), 0);
+    if (send_length != sizeof(rtspheader))
+    {
+        LOGE("send data head fail eager %d real %d\n", sizeof(rtspheader), send_length);
+        return;
+    }
+
+    send_length = send(send_sock_rtsp, &header, rtspheader.dwDataLen, 0);
+
+    int data_length = rtspheader.dwDataLen;
+    while(send_length < data_length)
+    {
+        int ret;
+        ret = send(send_sock_rtsp, &header+send_length, data_length - send_length, 0);
+        if(ret < 0)
+        {
+            perror("send stream rtsp data");
+            break;
+        }
+        else if(ret == 0)
+        {
+            break;
+        }
+        else
+        {
+            send_length += ret;
+        }
+    }
+
+}
+
+
+static void *testcallback(void *arg)
+{
+    qDebug() << "testcallback is " << arg;
+}
+
+static void *thread_imgprocess(void *)
+{
+
+}
+
+static void *thread_local_socket(void *)
+{
+    int socket_id = -1;
+    int ret;
+    int optval = 1;
+//	struct sockaddr_in servaddr;
+    struct sockaddr_un servaddr;
+    int seconds = RECV_TIMEOUT;
+
+    struct sockaddr_un client_addr;
+
+    int client_id;
+    int addr_size;
+
+    unsigned char buff[BUF_SIZE] = {0};
+
+//    FILE * file_fd;
+//    file_fd = fopen("venc.h264", "rb");
+//    if (file_fd == NULL)
+//    {
+//    	perror("open file");
+//    	return  (void *)-1;
+//    }
+    currentpthread = pthread_self();
+    qDebug() << "------------------------in thread_local socket-------------currentpthread = " << currentpthread;
+
+
+    socket_id = socket(PF_UNIX, SOCK_STREAM, 0);
+    if (socket_id < 0)
+    {
+        perror("socket error");
+        return (void *)-1;
+    }
+
+    ret = setsockopt(socket_id, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+    if(ret < 0)
+    {
+        perror("setsockopt error");
+        return (void *)-1;
+    }
+
+    ret = set_socket_timeout(socket_id, seconds);
+    if(ret == -1)
+    {
+        return (void *)-1;
+    }
+
+    memset(&servaddr, 0, sizeof(servaddr));
+
+    servaddr.sun_family = AF_UNIX;
+    strncpy(servaddr.sun_path, UNIX_DOMAIN, sizeof(servaddr.sun_path)-1);
+    unlink(UNIX_DOMAIN);
+
+    ret = bind(socket_id, (struct sockaddr *)&servaddr, sizeof(servaddr));
+    if (ret < 0)
+    {
+        printf("bind error");
+        unlink(UNIX_DOMAIN);
+        return (void *)-1;
+    }
+
+    ret = listen(socket_id, 5);
+    if (ret < 0)
+    {
+        perror("listen error");
+        unlink(UNIX_DOMAIN);
+        return (void *)-1;
+    }
+
+    addr_size = sizeof(client_addr);
+
+    while(is_exit == 0)
+    {
+        client_id = accept(socket_id, (struct sockaddr *)&client_addr, (socklen_t *)&addr_size);
+        if (client_id < 0)
+        {
+            if(errno == EAGAIN || errno == EINTR)
+            {
+                continue;
+            }
+            else
+            {
+                perror("accept error");
+                break;
+            }
+        }
+
+        send_sock_rtsp = client_id;
+
+        ret = set_socket_timeout(socket_id, seconds);
+        if(ret == -1)
+        {
+            close(socket_id);
+            continue;
+        }
+
+        while(is_exit == 0)
+        {
+            ret = recv(client_id, buff, BUF_SIZE, 0);	//ÓÃÓÚÅÐ¶ÏÊÇ·ñ¶Ï¿ªÁ¬½Ó
+            if (ret < 0)
+            {
+                if(errno == EAGAIN || errno == EINTR)
+                {
+                    continue;
+                }
+                else
+                {
+                    perror("recv error");
+                    break;
+                }
+            }
+            else if (ret == 0)
+            {
+                printf(" disconnected\n");
+                break;
+            }
+
+            // process
+//			send_h264(file_fd, client_id);
+//			send_h264_header();
+        }
+
+        send_sock_rtsp = -1;
+
+        close(client_id);
+    }
+
+//	fclose(file_fd);
+
+    close(socket_id);
+
+    return (void *)(0);
+}
+
+static void InitInputBuffer(VencInputBuffer inbuf)
+{
+    inputBuffer = inbuf;
+}
+
+
+void mycallback(void *func(void *), void *ptr)
+{
+    func(ptr);
+}
+
+class CRTSPThread : public QThread//by wgy
+{
+public:
+    explicit CRTSPThread(QObject *parent = 0): QThread(parent)
+    {
+        qDebug() << "construct CRTSPThread" ;
+    }
+
+protected:
+    void run()
+    {
+//        qDebug() << "run CRTSPThread";
+        mycallback(testcallback, NULL);
+//        while(1)
+//        {
+//         sleep(1);
+//         mycallbSack(testcallback, NULL);
+//         qDebug() << "run CRTSPThread" << QThread::currentThread();
+//        }
+    }
+};
+
+
+
+
+static void * thread_send_h264(void)
+{
+//	printf("%s >> %d\n", __FUNCTION__, __LINE__);
+
+    FILE * file_fd;
+    file_fd = fopen("venc.h264", "rb");
+    if (file_fd == NULL)
+    {
+        perror("open file");
+        return  (void *)-1;
+    }
+
+    int is_running = 1;
+
+    while (is_running == 1)
+    {
+        int read_length;
+        tFrameHead header;
+
+        if (send_sock_rtsp == -1)
+        {
+            continue;
+        }
+
+        read_length = fread(&header, 1, sizeof(header), file_fd);
+        if (read_length != sizeof(header))
+        {
+            printf("read header fail\n");
+            perror("read file head");
+            fseek(file_fd, 0, SEEK_SET);
+            continue;
+//			is_running = 0;
+//			break;
+        }
+
+        char *data_buf = (char *)malloc(header.dwDataLen);
+        read_length = fread(data_buf, 1, header.dwDataLen, file_fd);
+        if (read_length != header.dwDataLen)
+        {
+            printf("read data fail\n");
+            perror("read file head");
+            fseek(file_fd, 0, SEEK_SET);
+            free(data_buf);
+            continue;
+//			is_running = 0;
+//			break;
+        }
+
+        int send_length;
+        send_length = send(send_sock_rtsp, &header, sizeof(header), 0);
+        if (send_length != sizeof(header))
+        {
+//			printf("send data fail\n");
+            printf("send data head fail eager %d real %d\n", sizeof(header), send_length);
+            perror("send head");
+            continue;
+        }
+        //	printf("%s >> %d\n", __FUNCTION__, __LINE__);
+
+        //	write(sock_fd, data_buf, header.dwDataLen);
+        send_length = send(send_sock_rtsp, data_buf, header.dwDataLen, 0);
+//		if (send_length != header.dwDataLen)
+//		{
+//			printf("send data fail eager %d real %d\n", header.dwDataLen, send_length);
+//			perror("send data");
+//			free(data_buf);
+//			continue;
+//		}
+
+         int data_length = header.dwDataLen;
+//		 int send_length = 0;
+        while(send_length < data_length)
+        {
+            int ret;
+            ret = send(send_sock_rtsp, data_buf+send_length, data_length - send_length, 0);
+            if(ret < 0)
+            {
+                perror("send stream rtsp data");
+                break;
+            }
+            else if(ret == 0)
+            {
+                break;
+            }
+            else
+            {
+                send_length += ret;
+            }
+        }
+
+//		printf("%s >> %d\n", __FUNCTION__, __LINE__);
+
+        free(data_buf);
+
+        usleep(10*1000);
+    }
+
+    fclose(file_fd);
+
+    return 0;
+}
+
+static void usernotifyCallback(int32_t msgType, int32_t ext1,
+                        int32_t ext2, void* user)
+{
+//printf("cb------------------%p",user);
+    if ((msgType&CAMERA_MSG_ERROR) ==CAMERA_MSG_ERROR)
+    {
+        ALOGE("(msgType =CAMERA_MSG_ERROR)");
+
+    }
+
+    if ((msgType&CAMERA_MSG_DVR_STORE_ERR) ==CAMERA_MSG_DVR_STORE_ERR)
+    {
+        ALOGE("msgType =CAMERA_MSG_DVR_STORE_ERR)");
+
+        dvr_factory *p_dvr=(dvr_factory *)user;
+        p_dvr->storage_state=0;//tmp
+        p_dvr->stopRecord();
+        if(pstaticthis!=NULL)
+        {
+            if(p_dvr->mCameraId<SUPPORT_CAMERA_NUM)
+            {
+                if(pstaticthis->dvrCamera[p_dvr->mCameraId].getRecord())
+                    pstaticthis->dvrCamera[p_dvr->mCameraId].setRecord(false);//this is needed ,usrs must sync this ctrl status by self
+            }else
+            {
+                int i;
+                for(i=0;i<SUPPORT_CAMERA_NUM;i++){
+                    if(p_dvr->mCameraId==pstaticthis->dvrCamera[i].dvr->mCameraId){
+                        if(pstaticthis->dvrCamera[i].getRecord())
+                            pstaticthis->dvrCamera[i].setRecord(false);//this is needed ,usrs must sync this ctrl status by self
+                    }
+                }
+            }
+        }
+
+    }
+    //return NO_ERROR;
+
+}
+
+static void userdataCallback(int32_t msgType,
+                      char* dataPtr, camera_frame_metadata_t *metadata, void* user)
+{
+    if ((msgType&CAMERA_MSG_VIDEO_FRAME) ==CAMERA_MSG_VIDEO_FRAME)
+    {
+        ALOGV("now msgtype is 1-%d", msgType);
+    }
+    if ((msgType&CAMERA_MSG_PREVIEW_FRAME) ==CAMERA_MSG_PREVIEW_FRAME)
+    {
+        ALOGV("now msgtype is 2-%d timestam = %d", msgType,  nsStamp);
+    }
+    if ((msgType&CAMERA_MSG_POSTVIEW_FRAME) ==CAMERA_MSG_POSTVIEW_FRAME)
+    {
+        ALOGV("now msgtype is 3-%d", msgType);
+    }
+    if ((msgType&CAMERA_MSG_RAW_IMAGE) ==CAMERA_MSG_RAW_IMAGE)
+    {
+        ALOGV("now msgtype is 4-%d", msgType);
+    }
+
+    if ((msgType&CAMERA_MSG_COMPRESSED_IMAGE) ==CAMERA_MSG_COMPRESSED_IMAGE)
+    {
+        ALOGV("now msgtype is 5-%d", msgType);
+    }
+    char *p = (char *)dataPtr;
+    VencInputBuffer *pImage = (VencInputBuffer *)(p +4);
+//    dvr_factory *pdvr = (dvr_factory *)user;
+//    char bufname[512];
+//    sprintf(bufname,"64,64,0,64,250,123456 SDK,64,450,haha V1 alpha");
+//    pdvr->enableWaterMark();
+//    pdvr->setWaterMarkMultiple(bufname);
+//    if(p != NULL)
+//    {
+//        int time = metadata->faces->id;
+//    }
+//    ALOGV("now timestamp is %d", msgType);
+
+
+//    V4L2BUF_t *pAlgImg = (V4L2BUF_t *)p;
+//    ALOGV("the frame in us %f", pAlgImg->timeStamp);
+
+//    if(msgType & CAMERA_MSG_COMPRESSED_IMAGE)
+//    {
+//        ALOGV("store picture us time %p us size = %d",dataPtr, metadata->number_of_faces );
+//    }
+
+
+//    inputBuffer.pAddrPhyY = (unsigned char*)malloc(1280*720);
+//    memset(inputBuffer.pAddrPhyY, 64, 1280*720);
+//    dvr_factory *p_dvr=(dvr_factory *)user;
+//    char *ptp = (char *)dataPtr;
+//    VencInputBuffer *p = (VencInputBuffer *)(ptp +4);//all 10, this means only 10-4=6 farame be used
+//    memcpy(inputBuffer.pAddrVirY,(unsigned char*)p->pAddrVirY,1280*720);
+//    memcpy(inputBuffer.pAddrVirC,(unsigned char*)p->pAddrVirY+encode_param.src_width*encode_param.src_height,encode_param.src_width*encode_param.src_height/2);
+
+    //this is for our own callback to process yuv data that from the v4l2buf.
+
+    //return NO_ERROR;
+}
+
+
+static char bufname1[512];
+
+
+
+static void userdataCallbackTimestamp(nsecs_t timestamp,
+                               int32_t msgType, char* dataPtr, void* user)
+{
+    dvr_factory *pdvr1 = (dvr_factory *)user;
+    CdxMuxerPacketT pkt;
+//    quint64 msec = timestamp /1000;
+//    static int cnttt=0;
+//    static long long timeends=0;
+
+//    if(mCaptureFmt != V4L2_PIX_FMT_H264)
+//    {
+
+//    }
+//    ALOGV("timestamp msecs =  %d ", msec/*, timeend*/);
+    memset(&pkt, 0, sizeof(CdxMuxerPacketT));
+//    long long timestart= GetNowUs();
+//    long long timeend= GetNowUs();
+//    timeends+=timeend-timestart;
+
+
+    CdxMuxerPacketT *ppkt=(CdxMuxerPacketT *)&pkt;
+    char *ptp=(char *)dataPtr;
+    VencInputBuffer *p=(VencInputBuffer *)(ptp+4);
+    ppkt->buflen = p->nFlag;
+//    LOGW("h264 no encode ");
+//    if ((ppkt->buf = (char*)malloc(ppkt->buflen)) == NULL)
+//    {
+//        loge("pkt.buf malloc failed in	 frame\n");
+//        return;
+//    }
+    //F_LOG
+//    memcpy(ppkt->buf, p->pAddrVirY, ppkt->buflen);
+
+    ALOGE("encode p=%p,len=%d pk pts=%lld,inputpts=%lld/*,outpts=%lld*/",ppkt->buf,ppkt->buflen,ppkt->pts,p->nPts/*,outputBuffer.nPts*/);
+
+    ALOGV("timestamp = %lld ", p->nPts/1000000000);
+
+    if(p->nPts%5 == 0)
+    {
+        sprintf(bufname1,"128,128,0,128,250,%lld SDK,128,450,haha", p->nPts);
+        pdvr1->enableWaterMark();
+        pdvr1->setWaterMarkMultiple(bufname1);
+    }
+
+//    ppkt->duration = 1.0/ encode_param.frame_rate * 1000;
+//    ppkt->type = 0;
+//    ppkt->streamIndex = 0;
+//    ALOGV("timestart %d ", timestart/*, timeend*/);
+//    ALOGV("timeend   %d", timeend/*, timeend*/);
+//    ALOGV("ppkt=>nPts/1000 %d", ppkt->pts);
+//    ALOGV("store pic us time %lld us",timeend-timestart);
+
+//    if ((msgType&CAMERA_MSG_VIDEO_FRAME) ==CAMERA_MSG_VIDEO_FRAME)
+//    {
+//        ALOGV("now msgtype is 1-%d, timestamp = %d", msgType, timestamp);
+//    }
+//    if ((msgType&CAMERA_MSG_PREVIEW_FRAME) ==CAMERA_MSG_PREVIEW_FRAME)
+//    {
+//        ALOGV("now msgtype is 2-%d, timestamp = %d", msgType, timestamp);
+//    }
+//    if ((msgType&CAMERA_MSG_POSTVIEW_FRAME) ==CAMERA_MSG_POSTVIEW_FRAME)
+//    {
+//        nsStamp = timestamp;
+
+//        ALOGV("now msgtype is 3-%d, timestamp = %d", msgType, timestamp);
+//    }
+//    if ((msgType&CAMERA_MSG_RAW_IMAGE) ==CAMERA_MSG_RAW_IMAGE)
+//    {
+//        ALOGV("now msgtype is 4-%d, timestamp = %d", msgType, timestamp);
+//    }
+
+//    if ((msgType&CAMERA_MSG_COMPRESSED_IMAGE) ==CAMERA_MSG_COMPRESSED_IMAGE)
+//    {
+//        ALOGV("now msgtype is 5-%d, timestamp = %d", msgType, timestamp);
+//    }
+
+
+//    char *ptp=(char *)dataPtr;
+//    VencInputBuffer *p=(VencInputBuffer *)(ptp+4);
+
+//    nsStamp = timestamp;
+//    ALOGV("now timestamp is %d, msgtype= %d", timestamp, msgType);
+   // memcpy(inputBuffer.pAddrVirY,(unsigned char*)p->pAddrVirY,encode_param.src_width*encode_param.src_height);
+   // memcpy(inputBuffer.pAddrVirC,(unsigned char*)p->pAddrVirY+encode_param.src_width*encode_param.src_height,encode_param.src_width*encode_param.src_height/2);
+
+}
+
+//for preview SetDataCB
+static status_t usr_h264datacb(int32_t msgType,
+                        char *dataPtr,int dalen,
+                        void *user)
+{
+
+
+}
+
+//for rtsp set SetDataCB
+static status_t usr_datacb(int32_t msgType,
+                    char *dataPtr,int dalen,
+                    void *user)
+{
+
+    //LOGE("===========msgType =%d-----dataPtr=%p-----dalen %d)",msgType,dataPtr,dalen);
+
+//	if (h264fp == NULL) {
+//		h264fp = fopen("/tmp/test.h264", "wb");
+//		fwrite(header, 1, sizeof(header), h264fp);
+//	}
+//
+//	if (dalen != fwrite(dataPtr, 1, dalen, h264fp) )
+//		 LOGE("===========fwrite\n");
+
+    if (send_sock_rtsp == -1)
+    {
+        LOGE("=========== not connect!\n");
+        return 0;
+    }
+
+    send_h264_header();
+
+    tFrameHead header;
+    header.bySync = FRAME_HEAD_SYNC;
+    header.byType = FRAME_DATA_TYPE;
+    header.dwDataLen = dalen;
+
+    int send_length;
+    send_length = send(send_sock_rtsp, &header, sizeof(header), 0);
+    if (send_length != sizeof(header))
+    {
+//			printf("send data fail\n");
+        LOGE("send data head fail eager %d real %d\n", sizeof(header), send_length);
+        return 0;
+    }
+
+    send_length = send(send_sock_rtsp, dataPtr, header.dwDataLen, 0);
+
+    int data_length = header.dwDataLen;
+    while(send_length < data_length)
+    {
+        int ret;
+        ret = send(send_sock_rtsp, dataPtr+send_length, data_length - send_length, 0);
+        if(ret < 0)
+        {
+            perror("send stream rtsp data");
+            break;
+        }
+        else if(ret == 0)
+        {
+            break;
+        }
+        else
+        {
+            send_length += ret;
+        }
+    }
+
+
+    return 0;
+}
+
+
+#endif
